@@ -1,0 +1,474 @@
+module Main where
+
+import DA.Date
+import DA.Time()
+import DA.Optional()
+import Daml.Script
+
+-- Tipos de datos para departamentos
+type ApartmentId = Text
+type Price = Decimal
+type Address = Text
+type DocumentId = Text
+
+-- Estado de un departamento
+data ApartmentStatus
+  = Available -- Disponible para la venta
+  | Reserved -- Reservado pero no vendido
+  | Sold     -- Vendido
+  deriving (Eq, Show)
+  -- Eq es para igualdad (==, =)
+  -- Show funcionalidad de representacion en texto
+
+-- Informacion del departamento
+data ApartmentInfo = ApartmentInfo
+  with
+    apartmentId : ApartmentId
+    price : Price
+    area : Decimal  -- en metros cuadrados
+    bedrooms : Int
+    bathrooms : Int
+    floor : Int
+    address : Address
+    description : Text
+  deriving (Eq, Show)
+
+template Apartment
+  with
+    owner : Party            -- Propietario/desarrollador actual
+    info : ApartmentInfo     -- Informacion del departamento
+    status : ApartmentStatus -- Estado del departamento
+    viewers : [Party]        -- Partes que pueden ver el departamento
+  where
+    signatory owner
+    observer viewers
+
+    -- Clave unica para cada departamento (owner + apartmentId)
+    key (owner, info.apartmentId) : (Party, ApartmentId)
+    maintainer key._1
+
+    -- Publicar el departamento para su venta
+    choice PublishForSale : ContractId Apartment
+      controller owner
+      do
+        create this with
+          status = Available
+    
+    -- Actualizar el precio del departamento
+    choice UpdatePrice : ContractId Apartment
+      with
+        newPrice : Price
+      controller owner
+      do
+        create this with
+          info = info with price = newPrice
+    
+    -- Reservar un departamento para un posible comprador - ahora crea un ReservationOffer
+    choice Reserve : ContractId ReservationOffer
+      with
+        buyer : Party
+        reservationFee : Price
+        expiryDate : Date
+      controller owner
+      do
+        assertMsg "El departamento debe estar disponible para reservarlo" (status == Available)
+        
+        -- Verificar que no haya una reserva existente
+        assertMsg "El departamento ya está reservado" (status /= Reserved)
+        
+        -- Crear la oferta de reserva
+        offerCid <- create ReservationOffer with
+          seller = owner
+          buyer = buyer
+          apartmentId = info.apartmentId
+          fee = reservationFee
+          apartment = info
+          expiryDate = expiryDate
+        
+        -- Actualizar el estado del departamento a reservado
+        create this with
+          status = Reserved
+        
+        return offerCid
+
+    -- Marcar como vendido (después de firmar un contrato de venta)
+    choice MarkAsSold : ContractId Apartment
+      with
+        newOwner : Party
+      controller owner
+      do
+        create this with
+          owner = newOwner
+          status = Sold
+
+    -- Actualizar el estado del departamento (helper choice)
+    choice UpdateStatus : ContractId Apartment
+      with
+        newStatus : ApartmentStatus
+      controller owner
+      do
+        create this with
+          status = newStatus
+
+-- Nueva plantilla para ofertas de reserva (paso intermedio)
+template ReservationOffer
+  with
+    seller : Party
+    buyer : Party
+    apartmentId : ApartmentId
+    fee : Price
+    apartment : ApartmentInfo
+    expiryDate : Date
+  where
+    signatory seller
+    observer buyer
+    
+    -- El vendedor puede cancelar la oferta
+    choice CancelOffer : ContractId Apartment
+      controller seller
+      do
+        create Apartment with
+          owner = seller
+          info = apartment
+          status = Available
+          viewers = []
+    
+    -- El comprador acepta la reserva
+    choice AcceptReservation : ContractId ApartmentReservation
+      controller buyer
+      do
+        create ApartmentReservation with
+          seller = seller
+          buyer = buyer
+          apartmentId = apartmentId
+          fee = fee
+          apartment = apartment
+          expiryDate = expiryDate
+
+-- Plantilla para la reserva de un departamento (ahora con ambas partes como signatorios)
+template ApartmentReservation
+  with
+    seller : Party
+    buyer : Party
+    apartmentId : ApartmentId
+    fee : Price
+    apartment : ApartmentInfo
+    expiryDate : Date
+  where
+    signatory seller, buyer
+    
+    -- El comprador puede cancelar la reserva
+    choice CancelReservation : ContractId Apartment
+      controller buyer
+      do
+        -- Buscar el apartamento actual por clave
+        (apartmentCid, _) <- fetchByKey @Apartment (seller, apartmentId)
+        
+        -- Actualizar el estado del apartamento a disponible
+        exercise apartmentCid UpdateStatus with newStatus = Available
+        
+    -- El comprador confirma la compra
+    choice ConfirmPurchase : ContractId SalesAgreement
+      with
+        paymentMethod : Text
+        documentIds : [DocumentId]  -- IDs de documentos legales
+      controller buyer
+      do
+        create SalesAgreement with
+          seller = seller
+          buyer = buyer
+          apartment = apartment
+          totalPrice = apartment.price
+          reservationFee = fee
+          remainingAmount = apartment.price - fee
+          paymentMethod = paymentMethod
+          documentIds = documentIds
+          status = Pending
+
+data SalesStatus = Pending | Completed | Cancelled
+  deriving (Eq, Show)
+
+
+template SalesAgreement
+  with
+    seller : Party
+    buyer : Party
+    apartment : ApartmentInfo
+    totalPrice : Price
+    reservationFee : Price
+    remainingAmount : Price
+    paymentMethod : Text
+    documentIds : [DocumentId]
+    status : SalesStatus
+  where
+    signatory seller, buyer
+    
+    -- El vendedor confirma el pago
+    choice ConfirmPayment : ContractId SalesAgreement
+      controller seller
+      do
+        create this with
+          status = Completed
+    
+    -- El vendedor transfiere la propiedad
+    choice TransferOwnership : ContractId Apartment
+      controller seller
+      do
+        assertMsg "El pago debe estar completado" (status == Completed)
+        create Apartment with
+          owner = buyer
+          info = apartment
+          status = Sold
+          viewers = []
+    
+    -- Cancelar la venta
+    choice CancelSale : ContractId Apartment
+      controller seller
+      do
+        assertMsg "La venta no debe estar completada" (status /= Completed)
+        create Apartment with
+          owner = seller
+          info = apartment
+          status = Available
+          viewers = []
+
+
+template ApartmentListingService
+  with
+    serviceProvider : Party
+    apartments : [ContractId Apartment]
+  where
+    signatory serviceProvider
+    
+    -- Agregar un nuevo departamento al listado
+    choice AddApartment : ContractId ApartmentListingService
+      with
+        newApartment : ContractId Apartment
+      controller serviceProvider
+      do
+        create this with
+          apartments = newApartment :: apartments
+    
+    -- Busqueda de departamentos (simplificada)
+    nonconsuming choice SearchApartments : [ContractId Apartment]
+      with
+        maxPrice : Optional Price
+        minArea : Optional Decimal
+        minBedrooms : Optional Int
+      controller serviceProvider
+      do
+        return apartments
+
+-- Script para probar la funcionalidad del sistema
+test_purchase_department : Script ()
+test_purchase_department = script do
+  -- Crear usuarios para la prueba
+  developer <- allocateParty "Desarrolladora"
+  buyer1 <- allocateParty "Comprador1"
+  buyer2 <- allocateParty "Comprador2"
+  
+  -- Crear un departamento
+  let apartmentInfo = ApartmentInfo with
+        apartmentId = "APT-101"
+        price = 250000.00
+        area = 85.0
+        bedrooms = 2
+        bathrooms = 1
+        floor = 3
+        address = "Calle Principal 123, Torre Norte"
+        description = "Departamento moderno con vista a la ciudad"
+  
+  apartmentCid <- submit developer do
+    createCmd Apartment with
+      owner = developer
+      info = apartmentInfo
+      status = Available
+      viewers = []
+  
+  -- Publicar departamento para venta
+  apartmentCid <- submit developer do
+    exerciseCmd apartmentCid PublishForSale
+  
+  -- Crear oferta de reserva para el comprador 1
+  today <- getTime
+  let reservationDate = toDateUTC today
+      expiryDate = addDays reservationDate 15
+  
+  reservationOfferCid <- submit developer do
+    exerciseCmd apartmentCid Reserve with
+      buyer = buyer1
+      reservationFee = 25000.00
+      expiryDate = expiryDate
+  
+  -- Comprador 1 acepta la reserva
+  reservationCid <- submit buyer1 do
+    exerciseCmd reservationOfferCid AcceptReservation
+  
+  -- Comprador 1 decide confirmar la compra
+  agreementCid <- submit buyer1 do
+    exerciseCmd reservationCid ConfirmPurchase with
+      paymentMethod = "Transferencia bancaria"
+      documentIds = ["DOC-001", "DOC-002"]
+  
+  -- El desarrollador confirma el pago
+  agreementCid <- submit developer do
+    exerciseCmd agreementCid ConfirmPayment
+  
+  -- El desarrollador transfiere la propiedad
+  apartmentCid <- submit developer do
+    exerciseCmd agreementCid TransferOwnership
+  
+  -- Verificar que el departamento ahora pertenece al comprador 1
+  Some apartment <- queryContractId buyer1 apartmentCid
+  
+  debug "Estado final del departamento:"
+  debug apartment
+  
+  return ()
+
+-- Escenario de servicio de listado
+test_listing_service : Script ()
+test_listing_service = script do
+  serviceProvider <- allocateParty "InmobiliariaXYZ"
+  developer3 <- allocateParty "Desarrolladora3" -- Cambiado de Desarrolladora1
+  developer4 <- allocateParty "Desarrolladora4" -- Cambiado de Desarrolladora2
+  
+  -- Crear departamentos
+  let apt3Info = ApartmentInfo with
+        apartmentId = "APT-301-UNIQUE-LISTING"
+        price = 320000.00
+        area = 95.0
+        bedrooms = 3
+        bathrooms = 2
+        floor = 8
+        address = "Avenida del Parque 789"
+        description = "Amplio departamento familiar"
+        
+      apt4Info = ApartmentInfo with
+        apartmentId = "APT-302-UNIQUE" -- Cambiado para ser único
+        price = 180000.00
+        area = 60.0
+        bedrooms = 1
+        bathrooms = 1
+        floor = 4
+        address = "Calle de los Pinos 234"
+        description = "Departamento pequeño cerca de universidad"
+  
+  apt3Cid <- submit developer3 do
+    createCmd Apartment with
+      owner = developer3
+      info = apt3Info
+      status = Available
+      viewers = []
+  
+  apt4Cid <- submit developer4 do
+    createCmd Apartment with
+      owner = developer4
+      info = apt4Info
+      status = Available
+      viewers = []
+  
+  -- Crear servicio de listado
+  serviceCid <- submit serviceProvider do
+    createCmd ApartmentListingService with
+      serviceProvider = serviceProvider
+      apartments = []
+  
+  -- Agregar departamentos al listado
+  serviceCid <- submit serviceProvider do
+    exerciseCmd serviceCid AddApartment with
+      newApartment = apt3Cid
+  
+  serviceCid <- submit serviceProvider do
+    exerciseCmd serviceCid AddApartment with
+      newApartment = apt4Cid
+  
+  -- Buscar departamentos
+  foundApartments <- submit serviceProvider do
+    exerciseCmd serviceCid SearchApartments with
+      maxPrice = Some 200000.00
+      minArea = Some 50.0
+      minBedrooms = Some 1
+  
+  debug "Numero de departamentos encontrados:"
+  debug (length foundApartments)
+  
+  return ()
+
+
+-- Escenario alternativo: reserva cancelada
+test_reservation_cancellation : Script ()
+test_reservation_cancellation = script do
+  builder <- allocateParty "Bob el Constructor"
+  undecidedBuyer <- allocateParty "CompradorIndeciso"
+  
+  -- Create apartment with a different ID
+  let apartmentInfo = ApartmentInfo with
+        apartmentId = "ASD-APT-202-UNIQUE-RESERVATION"
+        price = 180000.00
+        area = 65.0
+        bedrooms = 1
+        bathrooms = 1
+        floor = 5
+        address = "Avenida Central 456, Edificio Sur"
+        description = "Departamento de 1 recamara, ideal para inversion"
+  
+  apartmentCid <- submit builder do
+    createCmd Apartment with
+      owner = builder
+      info = apartmentInfo
+      status = Available
+      viewers = []
+
+  debug "apartmentCid:"
+  debug apartmentCid
+  
+  -- Reservar departamento (crear oferta)
+  today <- getTime
+  let reservationDate = toDateUTC today
+      expiryDate = addDays reservationDate 15
+  
+  offerCid <- submit builder do
+    exerciseCmd apartmentCid Reserve with
+      buyer = undecidedBuyer
+      reservationFee = 18000.00
+      expiryDate = expiryDate
+  
+  debug "offerCid:"
+  debug offerCid
+  
+  -- El comprador acepta la oferta de reserva
+  reservationCid <- submit undecidedBuyer do
+    exerciseCmd offerCid AcceptReservation
+
+  debug "reservationCid:"
+  debug reservationCid
+  
+  -- El comprador cancela la reserva
+  apartmentCid <- submit undecidedBuyer do
+    exerciseCmd reservationCid CancelReservation
+
+  debug "aparmentCid:"
+  debug apartmentCid
+  
+  -- Verificar que el departamento vuelve a estar disponible
+  Some apartment <- queryContractId builder apartmentCid
+  
+  debug "Estado del departamento después de cancelar reserva:"
+  debug apartment
+  
+  return ()
+
+
+runAllScripts : Script ()
+runAllScripts = script do
+  debug "Ejecutando script de compra..."
+  test_purchase_department
+  
+  debug "Ejecutando script de cancelacion de reserva..."
+  -- test_reservation_cancellation
+  
+  debug "Ejecutando script de servicio de listado..."
+  test_listing_service
+  
+  return ()
