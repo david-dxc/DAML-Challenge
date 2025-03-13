@@ -6,6 +6,7 @@ name: department-sale
 source: daml
 init-script: Main:runAllScripts
 version: 0.0.1
+start-navigator: false
 dependencies:
   - daml-prim
   - daml-stdlib
