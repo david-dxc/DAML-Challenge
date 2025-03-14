@@ -101,14 +101,6 @@ template Apartment
           owner = newOwner
           status = Sold
 
-    -- Actualizar el estado del departamento (helper choice)
-    choice UpdateStatus : ContractId Apartment
-      with
-        newStatus : ApartmentStatus
-      controller owner
-      do
-        create this with
-          status = newStatus
 
 -- Nueva plantilla para ofertas de reserva (paso intermedio)
 template ReservationOffer
@@ -161,11 +153,15 @@ template ApartmentReservation
     choice CancelReservation : ContractId Apartment
       controller buyer
       do
-        -- Buscar el apartamento actual por clave
-        (apartmentCid, _) <- fetchByKey @Apartment (seller, apartmentId)
+        -- Crear un apartamento con ID modificado para evitar conflicto de claves
+        let modifiedApartment = apartment with
+              apartmentId = apartment.apartmentId <> "-" <> (show expiryDate)
         
-        -- Actualizar el estado del apartamento a disponible
-        exercise apartmentCid UpdateStatus with newStatus = Available
+        create Apartment with
+          owner = seller
+          info = modifiedApartment
+          status = Available
+          viewers = []
         
     -- El comprador confirma la compra
     choice ConfirmPurchase : ContractId SalesAgreement
@@ -402,9 +398,14 @@ test_reservation_cancellation = script do
   builder <- allocateParty "Bob el Constructor"
   undecidedBuyer <- allocateParty "CompradorIndeciso"
   
-  -- Create apartment with a different ID
+  -- Usar un timestamp para crear un ID único para cada ejecución
+  currentTime <- getTime
+  let uniqueTimestamp = show currentTime
+      uniqueAptId = "APT-" <> uniqueTimestamp
+  
+  -- Create apartment with a unique ID for this test run
   let apartmentInfo = ApartmentInfo with
-        apartmentId = "ASD-APT-202-UNIQUE-RESERVATION"
+        apartmentId = uniqueAptId
         price = 180000.00
         area = 65.0
         bedrooms = 1
@@ -459,14 +460,13 @@ test_reservation_cancellation = script do
   
   return ()
 
-
 runAllScripts : Script ()
 runAllScripts = script do
   debug "Ejecutando script de compra..."
   test_purchase_department
   
   debug "Ejecutando script de cancelacion de reserva..."
-  -- test_reservation_cancellation
+  test_reservation_cancellation
   
   debug "Ejecutando script de servicio de listado..."
   test_listing_service
